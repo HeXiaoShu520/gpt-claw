@@ -1,0 +1,26 @@
+# 原生 Codex 权限与扩展配置，gpt-claw 不再解析一套 allow/deny/ask 文件。
+approval_policy = "on-request"
+approvals_reviewer = "user"
+sandbox_mode = "workspace-write"
+web_search = "cached"
+model_auto_compact_token_limit = 64000
+
+[features]
+memories = true
+
+[sandbox_workspace_write]
+network_access = true
+
+[windows]
+sandbox = "unelevated"
+
+# 此飞书服务没有可用的桌面浏览器表面，网页操作交给本工程 personal MCP。
+[plugins."unified-computer-use@openai-bundled"]
+enabled = false
+
+# 自己的外部 MCP 可按 Codex 原生格式添加：
+# [mcp_servers.example]
+# command = "node"
+# args = ["C:/absolute/path/server.js"]
+# enabled = true
+# 工程启动时为每个会话注入 personal MCP 的本机地址，不需要手写端口。

@@ -1,0 +1,32 @@
+node_modules/
+integrations/windows-mcp/.venv/
+integrations/windows-mcp/__pycache__/
+dist/
+.env
+.env.*
+!.env.example
+data/
+workspace/*
+!workspace/.gitkeep
+!workspace/AGENTS.md
+.codex/config.local.toml
+*.log
+*.tmp
+desktop/.venv/
+desktop/data/
+desktop/**/__pycache__/
+desktop/**/*.pyc
+desktop/.minipet_temp/
+# Unused assets copied from the former standalone MiniPet project.
+desktop/res/items/easter/
+desktop/res/items/wooden_fish/
+desktop/res/sounds/easter/
+desktop/res/sounds/WoodenFish.*
+desktop/res/icons/easter/
+desktop/res/pet/
+desktop/头像/
+desktop/ui/
+desktop/third_party/cyber-zen/
+
+# Local visual reviews and model backups remain on this machine.
+artifacts/

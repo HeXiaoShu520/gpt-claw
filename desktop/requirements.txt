@@ -1,0 +1,9 @@
+pynput
+tendo
+websockets
+sounddevice
+numpy
+PySide6>=6.6.0
+PySide6-Fluent-Widgets==1.5.4
+sherpa-onnx
+pypinyin

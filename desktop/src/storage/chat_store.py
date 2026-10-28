@@ -1,0 +1,782 @@
+# coding:utf-8
+"""
+聊天记录持久化。
+
+每天一个 JSONL 会话文件，消息里的图片会落盘到 data/chat/images，运行时再转换
+成可展示/可发送给 LLM 的内容。SQLite 搜索库和 summaries.json 预留给历史搜索
+和摘要能力。
+"""
+
+import base64
+import hashlib
+import json
+import os
+import shutil
+import sqlite3
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+SCHEMA_VERSION = 2
+# 桌宠窗口与快捷输入共用一条持久会话。
+DESKTOP_SESSION_ID = 'desktop_main'
+
+
+class ChatStore:
+    """聊天消息、图片附件和历史索引的本地存储。
+
+    目录结构：
+      root_dir/
+        sessions/YYYY-MM-DD.jsonl  — 按天分文件的消息流水，每行一条 JSON
+        images/YYYY-MM-DD/         — 当天引用图片的落盘目录（data URL → 文件）
+        index.json                 — 会话元数据索引（session_id → 标题/预览等）
+        search.sqlite3             — FTS5 全文搜索库
+        summaries.json             — 每天对话摘要（预留，暂未启用）
+
+    旧记录保留 backend 字段；新消息统一归入 gpt-claw 桌面会话。
+    图片存储策略：写入时将 data URL 落盘为文件（节省 JSONL 体积），
+    读取时转回 file:// URI 供 UI 展示，发送给 LLM 时再转回 data URL。
+    """
+
+    def __init__(self, root_dir):
+        """初始化各子目录路径并确保根目录/sessions/images 存在。"""
+        self.root_dir = Path(root_dir)
+        self.sessions_dir = self.root_dir / 'sessions'
+        self.images_dir = self.root_dir / 'images'
+        self.index_file = self.root_dir / 'index.json'
+        self.search_db = self.root_dir / 'search.sqlite3'
+        self.summary_file = self.root_dir / 'summaries.json'
+        self.delivery_db = self.root_dir / 'delivery-receipts.sqlite3'
+        self._delivery_messages = None
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(str(self.delivery_db))
+        try:
+            conn.execute('CREATE TABLE IF NOT EXISTS receipts (delivery_id TEXT PRIMARY KEY)')
+            conn.commit()
+        finally:
+            conn.close()
+
+    def has_delivery(self, delivery_id):
+        """只保存投递编号，重连或清空历史后也不重复展示已确认的回复。"""
+        conn = sqlite3.connect(str(self.delivery_db))
+        try:
+            return conn.execute('SELECT 1 FROM receipts WHERE delivery_id=?', (delivery_id,)).fetchone() is not None
+        finally:
+            conn.close()
+
+    def mark_delivery(self, delivery_id):
+        conn = sqlite3.connect(str(self.delivery_db))
+        try:
+            conn.execute('INSERT OR IGNORE INTO receipts(delivery_id) VALUES (?)', (delivery_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _saved_delivery(self, delivery_id):
+        if self._delivery_messages is None:
+            self._delivery_messages = {}
+            for path in sorted(self.sessions_dir.glob('*.jsonl')):
+                for message in self.load_stored_date(path.stem):
+                    if message.get('delivery_id'):
+                        self._delivery_messages[message['delivery_id']] = message
+        return self._delivery_messages.get(delivery_id)
+
+    def global_session_id(self, backend):
+        """返回桌面通道的唯一持久会话 ID。"""
+        return DESKTOP_SESSION_ID
+
+    def load_backend_history(self, backend):
+        """加载指定后端的全部历史消息（跨所有天文件，按时间顺序）。"""
+        backend = self._normalize_backend(backend)
+        messages = []
+        for path in sorted(self.sessions_dir.glob('*.jsonl')):
+            for message in self.load_stored_date(path.stem):
+                if self._message_backend(message) == backend:
+                    messages.append(self.to_runtime_message(message))
+        return messages
+
+    def clear_backend_history(self, backend):
+        self.clear_backend(backend)
+
+    def today(self):
+        return datetime.now().strftime('%Y-%m-%d')
+
+    def load_today(self):
+        return self.load_date(self.today())
+
+    def load_recent(self, max_messages, backend='minipet'):
+        """从最新的 JSONL 文件倒序加载，直到凑够 max_messages 条为止。
+
+        倒序遍历文件列表，每次加载整天数据追加到结果头部，
+        达到上限后截取末尾 max_messages 条——这样优先保留最新消息。
+
+        之所以按天文件粒度加载而非逐行倒读，是因为 JSONL 文件无索引，
+        倒读需要全量扫描，开销与按天加载相近，而天文件粒度更容易缓存和删除。
+        """
+        messages = []
+        max_messages = max(0, int(max_messages or 0))
+        if max_messages <= 0:
+            return messages
+        for path in sorted(self.sessions_dir.glob('*.jsonl'), reverse=True):
+            day_messages = self.load_date(path.stem, backend=backend)
+            if day_messages:
+                messages = day_messages + messages
+            if len(messages) >= max_messages:
+                break
+        return messages[-max_messages:]
+
+    def create_session(self, backend='minipet'):
+        """新建多窗口会话，写入索引并返回随机生成的 session_id。"""
+        self._ensure_session_index()
+        now = datetime.now().isoformat(timespec='seconds')
+        session_id = uuid.uuid4().hex
+        index = self._read_index()
+        index['schema_version'] = SCHEMA_VERSION
+        index.setdefault('sessions', {})[session_id] = {
+            'session_id': session_id,
+            'backend': self._normalize_backend(backend),
+            'title': '新对话',
+            'created_at': now,
+            'updated_at': now,
+            'message_count': 0,
+            'preview': '',
+            'legacy': False,
+        }
+        self._write_index(index)
+        return session_id
+
+    def list_sessions(self, backend=None):
+        self._ensure_session_index()
+        sessions = self._read_index().get('sessions', {})
+        backend = self._normalize_backend(backend) if backend else None
+        items = [dict(value, session_id=key) for key, value in sessions.items()
+                 if not backend or self._normalize_backend(value.get('backend')) == backend]
+        return sorted(items, key=lambda item: item.get('updated_at', ''), reverse=True)
+
+    def desktop_session(self):
+        messages = self.load_desktop_session()
+        first = messages[0] if messages else {}
+        last = messages[-1] if messages else {}
+        title = self.content_text_for_memory(first.get('content', '')) or '桌宠对话'
+        return {
+            'session_id': DESKTOP_SESSION_ID,
+            'backend': 'minipet',
+            'title': title[:24],
+            'created_at': first.get('created_at', ''),
+            'updated_at': last.get('created_at', ''),
+            'message_count': len(messages),
+            'preview': self.content_text_for_memory(last.get('content', ''))[:80],
+            'legacy': False,
+            'global': True,
+        }
+
+    def load_desktop_session(self):
+        messages = []
+        for path in sorted(self.sessions_dir.glob('*.jsonl')):
+            for message in self.load_stored_date(path.stem):
+                if self._message_backend(message) == 'minipet':
+                    messages.append(self.to_runtime_message(message))
+        return messages
+
+    def get_session(self, session_id):
+        """返回会话元数据；不存在时返回 None。"""
+        if session_id == DESKTOP_SESSION_ID:
+            return self.desktop_session()
+        if not session_id:
+            return None
+        return next(
+            (item for item in self.list_sessions() if item.get('session_id') == session_id),
+            None,
+        )
+
+    def load_session(self, session_id):
+        messages = []
+        for path in sorted(self.sessions_dir.glob('*.jsonl')):
+            for message in self.load_stored_date(path.stem):
+                if self._session_id_for_message(path.stem, message) == session_id:
+                    messages.append(self.to_runtime_message(message))
+        return messages
+
+    def delete_session(self, session_id):
+        self._delivery_messages = None
+        changed = False
+        for path in self.sessions_dir.glob('*.jsonl'):
+            messages = self.load_stored_date(path.stem)
+            kept = [message for message in messages
+                    if self._session_id_for_message(path.stem, message) != session_id]
+            if len(kept) == len(messages):
+                continue
+            changed = True
+            if kept:
+                path.write_text(''.join(json.dumps(message, ensure_ascii=False) + '\n' for message in kept), encoding='utf-8')
+            else:
+                path.unlink()
+        if changed:
+            self.rebuild_metadata()
+        return changed
+
+    def load_stored_today(self):
+        return self.load_stored_date(self.today())
+
+    def load_stored_date(self, date_text):
+        messages = []
+        path = self._session_path(date_text)
+        if not path.is_file():
+            return messages
+        with path.open('r', encoding='utf-8', errors='replace') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+        return messages
+
+    def load_date(self, date_text, backend='minipet'):
+        messages = []
+        for stored in self.load_stored_date(date_text):
+            if self._message_backend(stored) == self._normalize_backend(backend):
+                messages.append(self.to_runtime_message(stored))
+        return messages
+
+    def append(self, role, content, source='chat_window', pet_name='', backend='minipet', session_id=None, footer='', delivery_id=''):
+        """写入一条新消息到当天 JSONL 文件，同时更新索引和搜索库。
+
+        图片内容（data URL）会被落盘为文件，JSONL 中只保存相对路径和哈希，
+        减少存储体积并便于去重。返回转换为运行时格式的消息 dict。
+        """
+        if delivery_id:
+            saved = self._saved_delivery(delivery_id)
+            if saved:
+                return self.to_runtime_message(saved)
+        now = datetime.now()
+        date_text = now.strftime('%Y-%m-%d')
+        message = {
+            'schema_version': SCHEMA_VERSION,
+            'id': now.strftime('%Y%m%d-%H%M%S-') + uuid.uuid4().hex[:8],
+            'created_at': now.isoformat(timespec='seconds'),
+            'role': role,
+            'source': source,
+            'backend': self._normalize_backend(backend),
+            'session_id': session_id or self.global_session_id(backend),
+            'pet_name': pet_name,
+            'content': self._persist_content_images(self._normalize_content(content), date_text),
+            'footer': footer,
+        }
+        if delivery_id:
+            message['delivery_id'] = delivery_id
+        self._session_path(date_text).parent.mkdir(parents=True, exist_ok=True)
+        with self._session_path(date_text).open('ab+') as f:
+            # 异常退出可能留下半行；先分行，避免吞掉下一条完整消息。
+            if f.tell():
+                f.seek(-1, os.SEEK_END)
+                if f.read(1) != b'\n':
+                    f.write(b'\n')
+            f.write((json.dumps(message, ensure_ascii=False) + '\n').encode('utf-8'))
+            f.flush()
+            os.fsync(f.fileno())
+        if delivery_id:
+            self._delivery_messages[delivery_id] = message
+        try:
+            self._update_index(date_text, message)
+        except Exception as e:
+            print('Chat metadata index failed:', e)
+        try:
+            self._index_message(date_text, message)
+        except Exception as e:
+            print('Chat search index failed:', e)
+        return self.to_runtime_message(message)
+
+    def clear_today(self):
+        self._delivery_messages = None
+        date_text = self.today()
+        session = self._session_path(date_text)
+        if session.exists():
+            session.unlink()
+        image_dir = self.images_dir / date_text
+        if image_dir.exists():
+            shutil.rmtree(image_dir)
+        self._remove_index_date(date_text)
+        self.delete_search_date(date_text)
+        self.delete_summary(date_text)
+
+    def clear_backend(self, backend):
+        """删除指定后端的所有消息，保留其他后端数据。
+
+        逐文件读取并过滤，有变更的文件原地覆写；全部删光的文件直接删除。
+        操作完成后重建 metadata（索引 + 搜索库），确保一致性。
+        """
+        self._delivery_messages = None
+        backend = self._normalize_backend(backend)
+        affected_dates = []
+        for path in sorted(self.sessions_dir.glob('*.jsonl')):
+            messages = self.load_stored_date(path.stem)
+            kept = [message for message in messages if self._message_backend(message) != backend]
+            if len(kept) == len(messages):
+                continue
+            affected_dates.append(path.stem)
+            if kept:
+                path.write_text(''.join(json.dumps(message, ensure_ascii=False) + '\n' for message in kept), encoding='utf-8')
+            else:
+                path.unlink()
+        self.rebuild_metadata()
+        for date_text in affected_dates:
+            self.delete_summary(date_text)
+
+    def clear_all(self):
+        # 投递回执不含正文，保留它，避免清空后迟到的重试恢复旧回复。
+        self._delivery_messages = None
+        for directory in (self.sessions_dir, self.images_dir):
+            if directory.exists():
+                shutil.rmtree(directory)
+        for path in (self.index_file, self.search_db, self.summary_file):
+            path.unlink(missing_ok=True)
+        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        self.images_dir.mkdir(parents=True, exist_ok=True)
+
+    def rebuild_metadata(self):
+        self.index_file.unlink(missing_ok=True)
+        conn = self._connect_search_db()
+        try:
+            conn.execute('DELETE FROM messages_fts')
+            conn.execute('DELETE FROM messages')
+            conn.commit()
+        finally:
+            conn.close()
+        for path in sorted(self.sessions_dir.glob('*.jsonl')):
+            for message in self.load_stored_date(path.stem):
+                self._update_index(path.stem, message)
+                try:
+                    self._index_message(path.stem, message)
+                except Exception as e:
+                    print('Chat search index failed:', e)
+
+    def _normalize_backend(self, backend):
+        return 'minipet'
+
+    def _message_backend(self, message):
+        return 'minipet'
+
+    def delete_date(self, date_text):
+        self._delivery_messages = None
+        session = self._session_path(date_text)
+        if session.exists():
+            session.unlink()
+        image_dir = self.images_dir / date_text
+        if image_dir.exists():
+            shutil.rmtree(image_dir)
+        self._remove_index_date(date_text)
+        self.delete_search_date(date_text)
+        self.delete_summary(date_text)
+
+    def to_runtime_message(self, stored_message):
+        """将磁盘格式（图片为相对路径）转换为运行时格式（图片为 file:// URI）。
+
+        单块纯文本消息简化为字符串，多块或含图片的消息保留为 list，
+        与 LLM 客户端的 content 格式约定保持一致。
+        """
+        return {
+            'id': stored_message.get('id', ''),
+            'created_at': stored_message.get('created_at', ''),
+            'role': stored_message.get('role', 'user'),
+            'content': self._resolve_runtime_content(stored_message.get('content', [])),
+            'footer': stored_message.get('footer', ''),
+            'backend': self._message_backend(stored_message),
+            'session_id': stored_message.get('session_id', ''),
+            'delivery_id': stored_message.get('delivery_id', ''),
+        }
+
+    def content_text_for_memory(self, content):
+        if isinstance(content, str):
+            return content.strip()
+        parts = []
+        for block in content or []:
+            block_type = block.get('type')
+            if block_type in ('text', 'code') and block.get('text'):
+                parts.append(block.get('text', ''))
+            elif block_type == 'image':
+                parts.append('[图片]')
+            elif block_type == 'file':
+                parts.append('[文件] ' + str(block.get('name') or ''))
+        return '\n'.join(part.strip() for part in parts if part and part.strip()).strip()
+
+    def content_for_llm(self, content):
+        if isinstance(content, str):
+            return content
+        blocks = []
+        for block in content or []:
+            block_type = block.get('type')
+            if block_type == 'text':
+                blocks.append({'type': 'text', 'text': block.get('text', '')})
+            elif block_type == 'image':
+                data_url = self._image_src_to_data_url(block.get('src', ''))
+                if data_url:
+                    blocks.append({'type': 'image_url', 'image_url': {'url': data_url}})
+                else:
+                    blocks.append({'type': 'text', 'text': '[图片已不存在]'})
+            elif block_type == 'code':
+                blocks.append({'type': 'text', 'text': block.get('text', '')})
+        return blocks or ''
+
+    def _session_path(self, date_text):
+        return self.sessions_dir / (date_text + '.jsonl')
+
+    def _normalize_content(self, content):
+        if isinstance(content, str):
+            return [{'type': 'text', 'text': content}]
+        normalized = []
+        for block in content or []:
+            block_type = block.get('type') or block.get('tag')
+            if block_type == 'text':
+                normalized.append({'type': 'text', 'text': block.get('text', '')})
+            elif block_type == 'image':
+                normalized.append({'type': 'image', 'src': block.get('src') or block.get('path') or '', 'alt': block.get('alt') or '图片'})
+            elif block_type == 'code':
+                normalized.append({'type': 'code', 'language': block.get('language', ''), 'text': block.get('text', '')})
+            elif block_type == 'file':
+                normalized.append({'type': 'file', 'path': block.get('path', ''), 'name': block.get('name', '文件')})
+        return normalized
+
+    def _persist_content_images(self, content, date_text):
+        """将内容块中的 data URL 图片落盘，返回替换后的 content 列表。
+
+        SHA-256 去重：相同图片只写一次文件，哈希前8位作为文件名后缀。
+        只处理 data:image/ 前缀的 base64 图片；已是文件路径的块直接透传。
+        """
+        persisted = []
+        for block in content:
+            if block.get('type') != 'image':
+                persisted.append(block)
+                continue
+            src = block.get('src', '')
+            if not src.startswith('data:image/'):
+                persisted.append(block)
+                continue
+            image = self._decode_data_url(src)
+            if image is None:
+                persisted.append(block)
+                continue
+            mime, data = image
+            suffix = '.jpg' if mime in ('image/jpeg', 'image/jpg') else '.png'
+            sha = hashlib.sha256(data).hexdigest()
+            image_dir = self.images_dir / date_text
+            image_dir.mkdir(parents=True, exist_ok=True)
+            filename = datetime.now().strftime('%Y%m%d-%H%M%S-') + sha[:8] + suffix
+            path = image_dir / filename
+            if not path.exists():
+                path.write_bytes(data)
+            persisted.append({
+                'type': 'image',
+                'src': str(Path('images') / date_text / filename).replace('\\', '/'),
+                'mime': mime,
+                'alt': block.get('alt') or '图片',
+                'bytes': len(data),
+                'sha256': sha,
+            })
+        return persisted
+
+    def _resolve_runtime_content(self, content):
+        """将存储格式的图片路径转为 file:// URI，供 Qt WebEngine / QLabel 直接渲染。
+
+        相对路径（如 images/2024-01-01/xxx.jpg）以 root_dir 为基准解析为绝对 URI。
+        单块纯文本消息简化为字符串，减少后续 LLM 调用时的类型判断。
+        """
+        runtime = []
+        for block in content or []:
+            if block.get('type') == 'image':
+                next_block = dict(block)
+                src = next_block.get('src', '')
+                if src and not src.startswith('data:') and not src.startswith('file:'):
+                    next_block['src'] = (self.root_dir / src).resolve().as_uri()
+                runtime.append(next_block)
+            else:
+                runtime.append(block)
+        if len(runtime) == 1 and runtime[0].get('type') == 'text':
+            return runtime[0].get('text', '')
+        return runtime
+
+    def _decode_data_url(self, src):
+        if ',' not in src:
+            return None
+        header, payload = src.split(',', 1)
+        if ';base64' not in header:
+            return None
+        mime = header.replace('data:', '').split(';', 1)[0]
+        try:
+            return mime, base64.b64decode(payload)
+        except Exception:
+            return None
+
+    def _image_src_to_data_url(self, src):
+        if not src:
+            return ''
+        if src.startswith('data:image/'):
+            return src
+        path = self._src_to_path(src)
+        if path is None or not path.is_file():
+            return ''
+        suffix = path.suffix.lower()
+        mime = 'image/jpeg' if suffix in ('.jpg', '.jpeg') else 'image/png'
+        return 'data:%s;base64,%s' % (mime, base64.b64encode(path.read_bytes()).decode('ascii'))
+
+    def _src_to_path(self, src):
+        if src.startswith('file:///'):
+            # URL解码，处理中文路径（Windows 路径含中文时 Qt 会编码为 %XX 序列）
+            from urllib.parse import unquote
+            decoded = unquote(src.replace('file:///', '', 1))
+            return Path(decoded)
+        path = Path(src)
+        if path.is_absolute():
+            return path
+        return self.root_dir / path
+
+    def _connect_search_db(self):
+        conn = sqlite3.connect(str(self.search_db))
+        conn.row_factory = sqlite3.Row
+        self._ensure_search_schema(conn)
+        return conn
+
+    def _ensure_search_schema(self, conn):
+        # FTS5 虚拟表以 messages 为内容表（content-rowid 映射），避免重复存储文本
+        # 历史兼容：v1 schema 没有 session_id 列，需按需 ALTER TABLE 升级；
+        # 用 PRAGMA table_info 而非 try/except ALTER 是因为后者会产生日志噪音
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS messages (
+                id TEXT PRIMARY KEY,
+                date TEXT NOT NULL,
+                created_at TEXT,
+                role TEXT,
+                source TEXT,
+                session_id TEXT,
+                pet_name TEXT,
+                text TEXT NOT NULL,
+                json TEXT NOT NULL
+            )
+        ''')
+        columns = {row['name'] for row in conn.execute('PRAGMA table_info(messages)')}
+        if 'session_id' not in columns:
+            conn.execute('ALTER TABLE messages ADD COLUMN session_id TEXT')
+        conn.execute('CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(text, content="messages", content_rowid="rowid")')
+        conn.commit()
+
+    def _index_message(self, date_text, message):
+        text = self.content_text_for_memory(message.get('content', ''))
+        if not text:
+            return False
+        conn = self._connect_search_db()
+        try:
+            old = conn.execute('SELECT rowid FROM messages WHERE id=?', (message.get('id'),)).fetchone()
+            if old:
+                conn.execute('DELETE FROM messages_fts WHERE rowid=?', (old['rowid'],))
+            conn.execute('''
+                INSERT OR REPLACE INTO messages(id, date, created_at, role, source, session_id, pet_name, text, json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                message.get('id'),
+                date_text,
+                message.get('created_at', ''),
+                message.get('role', ''),
+                message.get('source', ''),
+                message.get('session_id', self._legacy_session_id(date_text, message)),
+                message.get('pet_name', ''),
+                text,
+                json.dumps(message, ensure_ascii=False),
+            ))
+            row = conn.execute('SELECT rowid FROM messages WHERE id=?', (message.get('id'),)).fetchone()
+            if row:
+                conn.execute('INSERT INTO messages_fts(rowid, text) VALUES (?, ?)', (row['rowid'], text))
+            conn.commit()
+        finally:
+            conn.close()
+        return True
+
+    def rebuild_search_index(self):
+        indexed = 0
+        with self._connect_search_db() as conn:
+            conn.execute('DELETE FROM messages_fts')
+            conn.execute('DELETE FROM messages')
+            conn.commit()
+        for path in sorted(self.sessions_dir.glob('*.jsonl')):
+            date_text = path.stem
+            for message in self.load_stored_date(date_text):
+                if self._index_message(date_text, message):
+                    indexed += 1
+        return indexed
+
+    def search_messages(self, query, limit=50, date_from='', date_to=''):
+        """全文搜索消息，优先用 FTS5 索引，不足时补充 LIKE 模糊匹配。
+
+        FTS5 使用 BM25 排序（rank），速度快但需要分词；
+        LIKE 兜底可匹配 FTS5 遗漏的短词，但性能较差，仅在结果不足时触发。
+        两种结果用 seen 集合去重，保证最终列表无重复。
+        """
+        query = (query or '').strip()
+        if not query:
+            return []
+        limit = max(1, min(200, int(limit or 50)))
+        params = []
+        filters = []
+        if date_from:
+            filters.append('m.date >= ?')
+            params.append(date_from)
+        if date_to:
+            filters.append('m.date <= ?')
+            params.append(date_to)
+        where_extra = (' AND ' + ' AND '.join(filters)) if filters else ''
+        results = []
+        try:
+            with self._connect_search_db() as conn:
+                sql = 'SELECT m.* FROM messages_fts f JOIN messages m ON m.rowid=f.rowid WHERE messages_fts MATCH ?%s ORDER BY rank LIMIT ?' % where_extra
+                rows = conn.execute(sql, [query, *params, limit]).fetchall()
+                results = [dict(row) for row in rows]
+                if len(results) < limit:
+                    like_sql = 'SELECT * FROM messages m WHERE m.text LIKE ?%s ORDER BY created_at DESC LIMIT ?' % where_extra
+                    seen = {r.get('id') for r in results}
+                    for row in conn.execute(like_sql, ['%' + query + '%', *params, limit]).fetchall():
+                        item = dict(row)
+                        if item.get('id') not in seen:
+                            results.append(item)
+                            seen.add(item.get('id'))
+                        if len(results) >= limit:
+                            break
+        except Exception as e:
+            print('Chat search failed:', e)
+        for item in results:
+            text = item.get('text', '')
+            item['snippet'] = text[:220]
+        return results
+
+    def clear_search_index(self):
+        if self.search_db.exists():
+            self.search_db.unlink()
+
+    def delete_search_date(self, date_text):
+        try:
+            with self._connect_search_db() as conn:
+                rows = conn.execute('SELECT rowid FROM messages WHERE date=?', (date_text,)).fetchall()
+                for row in rows:
+                    conn.execute('DELETE FROM messages_fts WHERE rowid=?', (row['rowid'],))
+                conn.execute('DELETE FROM messages WHERE date=?', (date_text,))
+                conn.commit()
+        except Exception as e:
+            print('Delete chat search date failed:', e)
+
+    def _read_summaries(self):
+        if not self.summary_file.is_file():
+            return {'schema_version': SCHEMA_VERSION, 'summaries': {}}
+        try:
+            data = json.loads(self.summary_file.read_text(encoding='utf-8'))
+        except Exception:
+            return {'schema_version': SCHEMA_VERSION, 'summaries': {}}
+        data.setdefault('schema_version', SCHEMA_VERSION)
+        data.setdefault('summaries', {})
+        return data
+
+    def _write_summaries(self, data):
+        self.summary_file.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    def save_summary(self, date_text, summary, message_count=0, model=''):
+        data = self._read_summaries()
+        summaries = data.setdefault('summaries', {})
+        now = datetime.now().isoformat(timespec='seconds')
+        old = summaries.get(date_text, {})
+        summaries[date_text] = {
+            'date': date_text,
+            'created_at': old.get('created_at') or now,
+            'updated_at': now,
+            'message_count': int(message_count or 0),
+            'model': model or '',
+            'summary': summary or '',
+        }
+        self._write_summaries(data)
+        return summaries[date_text]
+
+    def load_summary(self, date_text):
+        return self._read_summaries().get('summaries', {}).get(date_text)
+
+    def list_summaries(self):
+        summaries = self._read_summaries().get('summaries', {})
+        return [summaries[key] for key in sorted(summaries.keys(), reverse=True)]
+
+    def delete_summary(self, date_text):
+        data = self._read_summaries()
+        existed = data.get('summaries', {}).pop(date_text, None) is not None
+        if existed:
+            self._write_summaries(data)
+        return existed
+
+    def build_summary_source(self, date_text, max_chars=12000):
+        messages = self.load_stored_date(date_text)
+        lines = []
+        for message in messages:
+            text = self.content_text_for_memory(message.get('content', ''))
+            if not text:
+                continue
+            created_at = message.get('created_at', '')
+            time_text = created_at[11:16] if len(created_at) >= 16 else ''
+            role = '用户' if message.get('role') == 'user' else '宠物'
+            lines.append('[%s][%s] %s' % (time_text, role, text))
+        source = '\n'.join(lines)
+        max_chars = max(1000, int(max_chars or 12000))
+        if len(source) > max_chars:
+            half = max_chars // 2
+            source = source[:half] + '\n...（中间省略）...\n' + source[-half:]
+        return source, len(messages)
+
+    def _read_index(self):
+        if not self.index_file.is_file():
+            return {'schema_version': SCHEMA_VERSION, 'sessions': {}}
+        try:
+            return json.loads(self.index_file.read_text(encoding='utf-8'))
+        except Exception:
+            return {'schema_version': SCHEMA_VERSION, 'sessions': {}}
+
+    def _write_index(self, index):
+        self.index_file.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding='utf-8')
+
+    def _update_index(self, date_text, message):
+        index = self._read_index()
+        index['schema_version'] = SCHEMA_VERSION
+        sessions = index.setdefault('sessions', {})
+        session_id = self._session_id_for_message(date_text, message)
+        item = sessions.setdefault(session_id, {
+            'session_id': session_id,
+            'backend': self._message_backend(message),
+            'title': '新对话',
+            'created_at': message.get('created_at', ''),
+            'message_count': 0,
+            'preview': '',
+            'legacy': 'session_id' not in message,
+        })
+        item['message_count'] = int(item.get('message_count', 0)) + 1
+        item['updated_at'] = message.get('created_at')
+        item['preview'] = self._preview(message.get('content', []))
+        if item.get('title') == '新对话' and message.get('role') == 'user' and item['preview']:
+            item['title'] = item['preview'][:24]
+        self._write_index(index)
+
+    def _remove_index_date(self, date_text):
+        self.rebuild_metadata()
+
+    def _legacy_session_id(self, date_text, message):
+        return 'legacy:%s:%s' % (date_text, self._message_backend(message))
+
+    def _session_id_for_message(self, date_text, message):
+        return message.get('session_id') or self._legacy_session_id(date_text, message)
+
+    def _ensure_session_index(self):
+        index = self._read_index()
+        if index.get('schema_version') != SCHEMA_VERSION or (not index.get('sessions') and any(self.sessions_dir.glob('*.jsonl'))):
+            self.rebuild_metadata()
+
+    def _preview(self, content):
+        for block in content or []:
+            if block.get('type') == 'text' and block.get('text'):
+                return block['text'][:80]
+        if any(block.get('type') == 'image' for block in content or []):
+            return '[图片]'
+        return ''

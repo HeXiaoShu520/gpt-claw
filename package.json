@@ -1,0 +1,49 @@
+{
+  "name": "gpt-claw",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "A personal Feishu assistant powered by local Codex",
+  "engines": {
+    "node": ">=22.16.0"
+  },
+  "scripts": {
+    "start": "tsx src/desktop/launch.ts --with-service",
+    "start:claw": "tsx src/main.ts",
+    "start:pet": "tsx src/desktop/launch.ts",
+    "start:desktop": "npm run start:claw",
+    "pet": "npm run start:pet",
+    "desktop:setup": "python -m venv desktop/.venv && desktop\\.venv\\Scripts\\python.exe -m pip install -r desktop/requirements.txt",
+    "desktop:ui": "npm run start:pet",
+    "dev": "tsx src/desktop/launch.ts --with-service --dev",
+    "dev:claw": "tsx src/desktop/launch.ts --service-only --dev",
+    "check": "tsc --noEmit && tsc -p tsconfig.tools.json",
+    "computer:setup": "uv sync --project integrations/windows-mcp --python 3.14 --locked",
+    "build": "tsc",
+    "start:built": "node --import tsx dist/main.js",
+    "doctor": "tsx src/doctor.ts",
+    "feishu:commands": "tsx src/feishu/sync-commands.ts",
+    "codex:login": "node node_modules/@openai/codex/bin/codex.js login",
+    "codex:status": "node node_modules/@openai/codex/bin/codex.js login status"
+  },
+  "dependencies": {
+    "@larksuite/cli": "1.0.95",
+    "@larksuiteoapi/node-sdk": "1.74.0",
+    "@modelcontextprotocol/sdk": "1.30.1",
+    "@openai/codex": "0.157.1",
+    "croner": "^10.0.1",
+    "dotenv": "^17.4.2",
+    "koffi": "3.1.0",
+    "playwright-core": "1.63.0",
+    "qrcode-terminal": "^0.12.0",
+    "tsx": "4.22.1",
+    "ws": "^8.22.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.19.19",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.18.1",
+    "typescript": "5.9.3"
+  }
+}
